@@ -12,13 +12,17 @@ export function openStore(path){
  mkdirSync(dirname(path),{recursive:true});const db=new DatabaseSync(path);
  db.exec('PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');
  const version=db.prepare('PRAGMA user_version').get().user_version;
- if(version>1){db.close();throw Error('지원하지 않는 DB 구조 버전');}
+ if(version>2){db.close();throw Error('지원하지 않는 DB 구조 버전');}
  db.exec(`CREATE TABLE IF NOT EXISTS owners(id TEXT PRIMARY KEY,name TEXT NOT NULL);
  INSERT OR IGNORE INTO owners VALUES('local-owner','사용자');
  CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY,owner_id TEXT NOT NULL REFERENCES owners(id),title TEXT NOT NULL,request TEXT NOT NULL,criteria TEXT NOT NULL,deadline TEXT NOT NULL,target_date TEXT NOT NULL,next_action TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('할 일','진행 중','완료','보류')),version INTEGER NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY,task_id TEXT NOT NULL REFERENCES tasks(id),owner_id TEXT NOT NULL REFERENCES owners(id),created_at TEXT NOT NULL,note TEXT NOT NULL,changes TEXT NOT NULL);
- CREATE INDEX IF NOT EXISTS events_task ON events(task_id,created_at);
- PRAGMA user_version=1;`);return db;
+ CREATE INDEX IF NOT EXISTS events_task ON events(task_id,created_at);`);
+ if(version<1)db.exec('PRAGMA user_version=1;');
+ if(version<2)db.exec(`CREATE TABLE daily_logs(work_date TEXT PRIMARY KEY,owner_id TEXT NOT NULL REFERENCES owners(id),internal_md TEXT NOT NULL,public_md TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('초안','확정')),version INTEGER NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,confirmed_at TEXT NOT NULL);
+ CREATE INDEX daily_logs_updated ON daily_logs(updated_at);
+ PRAGMA user_version=2;`);
+ return db;
 }
 function fail(status,message){throw Object.assign(Error(message),{status});}
 function fields(data){
@@ -33,6 +37,12 @@ export function createApp(db,config={companyName:'내 업무'}){
  const escape=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
  const page=readFileSync(new URL('./index.html',import.meta.url),'utf8').replaceAll('WORKLOG_COMPANY',escape(config.companyName));
  const get=id=>{const t=db.prepare('SELECT * FROM tasks WHERE id=?').get(id);if(!t)fail(404,'업무를 찾지 못했습니다.');return {...t,events:db.prepare('SELECT * FROM events WHERE task_id=? ORDER BY created_at,rowid').all(id)};};
+ const getDaily=date=>db.prepare('SELECT * FROM daily_logs WHERE work_date=?').get(date)??{work_date:date,internal_md:'',public_md:'',status:'초안',version:0,created_at:'',updated_at:'',confirmed_at:''};
+ const readJson=async req=>{
+  if(!req.headers['content-type']?.startsWith('application/json'))fail(415,'JSON 형식이 필요합니다.');
+  let text='',bytes=0;for await(const chunk of req){bytes+=chunk.length;if(bytes>500000)fail(413,'입력이 너무 큽니다.');text+=chunk;}
+  try{const data=JSON.parse(text);if(!data||typeof data!=='object'||Array.isArray(data))fail(400,'입력 형식을 확인하세요.');return data;}catch(e){if(e.status)throw e;fail(400,'입력 형식을 확인하세요.');}
+ };
  return createServer(async(req,res)=>{
   const json=(status,body)=>{res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});res.end(JSON.stringify(body));};
   try{
@@ -46,13 +56,38 @@ export function createApp(db,config={companyName:'내 업무'}){
     if(!config.dbPath)fail(503,'DB 경로 설정이 필요합니다.');
     try{return json(201,backupStore(db,resolve(dirname(config.dbPath),'backups')));}catch{fail(500,'백업에 실패했습니다. 기존 백업을 보존했습니다. 저장 공간과 권한을 확인하세요.');}
    }
+   const daily=path.match(/^\/api\/daily-logs\/(\d{4}-\d{2}-\d{2})(\/confirm)?$/);
+   if(daily){
+    const date=daily[1];
+    if(Number.isNaN(Date.parse(date))||new Date(date).toISOString().slice(0,10)!==date)fail(400,'날짜를 확인하세요.');
+    if(req.method==='GET'&&!daily[2])return json(200,getDaily(date));
+    const data=await readJson(req);
+    if(!Number.isInteger(data.version)||data.version<0)fail(400,'기록 버전을 확인하세요.');
+    if(req.method==='PUT'&&!daily[2]){
+     for(const key of ['internal_md','public_md'])if(typeof data[key]!=='string'||data[key].length>200000)fail(400,'요약 내용을 확인하세요.');
+     const now=new Date().toISOString(),old=getDaily(date);
+     if(data.version!==old.version)fail(409,'다른 변경이 먼저 저장되었습니다. 최신 일일 기록을 불러오세요.');
+     db.exec('BEGIN IMMEDIATE');try{
+      if(old.version===0)db.prepare('INSERT INTO daily_logs VALUES(?,?,?,?,?,?,?,?,?)').run(date,'local-owner',data.internal_md,data.public_md,'초안',1,now,now,'');
+      else db.prepare("UPDATE daily_logs SET internal_md=?,public_md=?,status='초안',version=version+1,updated_at=?,confirmed_at='' WHERE work_date=?").run(data.internal_md,data.public_md,now,date);
+      db.exec('COMMIT');
+     }catch(e){db.exec('ROLLBACK');throw e;}
+     return json(200,getDaily(date));
+    }
+    if(req.method==='POST'&&daily[2]){
+     const old=getDaily(date);
+     if(!old.version)fail(404,'먼저 일일 요약 초안을 저장하세요.');
+     if(data.version!==old.version)fail(409,'다른 변경이 먼저 저장되었습니다. 최신 일일 기록을 불러오세요.');
+     if(!old.public_md.trim())fail(400,'외부용 내용을 작성한 뒤 확정하세요.');
+     const now=new Date().toISOString();db.prepare("UPDATE daily_logs SET status='확정',version=version+1,updated_at=?,confirmed_at=? WHERE work_date=?").run(now,now,date);
+     return json(200,getDaily(date));
+    }
+    fail(405,'지원하지 않는 요청입니다.');
+   }
    const id=path.startsWith('/api/tasks/')?path.slice('/api/tasks/'.length):null;
    if(req.method==='GET'&&id)return json(200,get(id));
    if(!((req.method==='POST'&&path==='/api/tasks')||(req.method==='PATCH'&&id)))fail(404,'지원하지 않는 경로입니다.');
-   if(!req.headers['content-type']?.startsWith('application/json'))fail(415,'JSON 형식이 필요합니다.');
-   let body='',bytes=0;for await(const chunk of req){bytes+=chunk.length;if(bytes>100000)fail(413,'입력이 너무 큽니다.');body+=chunk;}
-   let data;try{data=JSON.parse(body);}catch{fail(400,'입력 형식을 확인하세요.');}
-   if(!data||typeof data!=='object'||Array.isArray(data))fail(400,'입력 형식을 확인하세요.');
+   const data=await readJson(req);
    const input=fields(data),now=new Date().toISOString();
    if(req.method==='POST'){
     const taskId=randomUUID();db.exec('BEGIN IMMEDIATE');try{

@@ -12,7 +12,7 @@ export function backupStore(db,directory){
   db.prepare('VACUUM INTO ?').run(partial);
   check=new DatabaseSync(partial,{readOnly:true});
   if(check.prepare('PRAGMA integrity_check').get().integrity_check!=='ok'||check.prepare('PRAGMA foreign_key_check').all().length)throw Error('백업 무결성 확인 실패');
-  for(const table of ['owners','tasks','events'])if(check.prepare(`SELECT count(*) AS n FROM ${table}`).get().n!==db.prepare(`SELECT count(*) AS n FROM ${table}`).get().n)throw Error('백업 중 데이터가 변경되었습니다. 다시 시도하세요.');
+  for(const table of ['owners','tasks','events','daily_logs'])if(check.prepare(`SELECT count(*) AS n FROM ${table}`).get().n!==db.prepare(`SELECT count(*) AS n FROM ${table}`).get().n)throw Error('백업 중 데이터가 변경되었습니다. 다시 시도하세요.');
   check.close();check=null;renameSync(partial,target);
  }catch(error){check?.close();if(existsSync(partial))unlinkSync(partial);throw error;}
  let warning='';
