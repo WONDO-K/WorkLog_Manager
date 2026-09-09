@@ -1,0 +1,5 @@
+{
+  "companyName": "내 업무",
+  "dbPath": "data/worklog.sqlite",
+  "port": 8765
+}
