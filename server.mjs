@@ -5,6 +5,7 @@ import {dirname,resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {randomUUID} from 'node:crypto';
 import {loadConfig} from './config.mjs';
+import {backupStore} from './backup.mjs';
 
 const states=['할 일','진행 중','완료','보류'];
 export function openStore(path){
@@ -40,6 +41,11 @@ export function createApp(db,config={companyName:'내 업무'}){
    const path=new URL(req.url,`http://${expected}`).pathname;
    if(req.method==='GET'&&path==='/'){res.writeHead(200,{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store','Content-Security-Policy':"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",'X-Content-Type-Options':'nosniff'});return res.end(page);}
    if(req.method==='GET'&&path==='/api/tasks')return json(200,db.prepare('SELECT * FROM tasks ORDER BY updated_at DESC,rowid DESC').all());
+   if(req.method==='POST'&&path==='/api/backup'){
+    if(!req.headers['content-type']?.startsWith('application/json'))fail(415,'JSON 형식이 필요합니다.');
+    if(!config.dbPath)fail(503,'DB 경로 설정이 필요합니다.');
+    try{return json(201,backupStore(db,resolve(dirname(config.dbPath),'backups')));}catch{fail(500,'백업에 실패했습니다. 기존 백업을 보존했습니다. 저장 공간과 권한을 확인하세요.');}
+   }
    const id=path.startsWith('/api/tasks/')?path.slice('/api/tasks/'.length):null;
    if(req.method==='GET'&&id)return json(200,get(id));
    if(!((req.method==='POST'&&path==='/api/tasks')||(req.method==='PATCH'&&id)))fail(404,'지원하지 않는 경로입니다.');
