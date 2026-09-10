@@ -1,7 +1,7 @@
 import {DatabaseSync} from 'node:sqlite';
 import {createServer} from 'node:http';
-import {readFileSync,mkdirSync} from 'node:fs';
-import {dirname,resolve} from 'node:path';
+import {readFileSync,mkdirSync,renameSync,rmSync,writeFileSync} from 'node:fs';
+import {dirname,join,resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {randomUUID} from 'node:crypto';
 import {loadConfig} from './config.mjs';
@@ -25,6 +25,16 @@ export function openStore(path){
  return db;
 }
 function fail(status,message){throw Object.assign(Error(message),{status});}
+function exportDaily(log,dir){
+ if(!dir)return false;
+ mkdirSync(dir,{recursive:true});
+ const files=[[`${log.work_date}.internal.md`,log.internal_md],[`${log.work_date}.md`,log.public_md]],temps=[];
+ try{
+  for(const [name,content]of files){const temp=join(dir,`.${name}.${randomUUID()}.tmp`);temps.push(temp);writeFileSync(temp,content,{encoding:'utf8',flag:'wx'});}
+  files.forEach(([name],i)=>renameSync(temps[i],join(dir,name)));
+ }finally{for(const temp of temps)rmSync(temp,{force:true});}
+ return true;
+}
 function fields(data){
  const result={};for(const key of ['title','request','criteria','deadline','target_date','next_action']){
   const v=data[key]??'';if(typeof v!=='string'||v.length>20000)fail(400,'입력 길이나 형식을 확인하세요.');result[key]=v.trim();
@@ -79,8 +89,9 @@ export function createApp(db,config={companyName:'내 업무'}){
      if(!old.version)fail(404,'먼저 일일 요약 초안을 저장하세요.');
      if(data.version!==old.version)fail(409,'다른 변경이 먼저 저장되었습니다. 최신 일일 기록을 불러오세요.');
      if(!old.public_md.trim())fail(400,'외부용 내용을 작성한 뒤 확정하세요.');
+     let exported=false;try{exported=exportDaily(old,config.exportDir);}catch{fail(500,'Markdown 파일을 내보내지 못했습니다. 경로와 쓰기 권한을 확인하세요.');}
      const now=new Date().toISOString();db.prepare("UPDATE daily_logs SET status='확정',version=version+1,updated_at=?,confirmed_at=? WHERE work_date=?").run(now,now,date);
-     return json(200,getDaily(date));
+     return json(200,{...getDaily(date),exported});
     }
     fail(405,'지원하지 않는 요청입니다.');
    }
